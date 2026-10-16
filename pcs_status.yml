@@ -1,0 +1,15 @@
+---
+- name: Pacemaker Cluster Status Check
+  hosts: pacemaker
+  gather_facts: false
+
+  tasks:
+    - name: Check pcs status
+      ansible.builtin.command: pcs sstatus
+      become: true
+      register: pcs_result
+      changed_when: false
+
+    - name: show pcs status
+      ansible.builtin.debug:
+        var: pcs_result.stdout_lines
