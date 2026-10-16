@@ -4,12 +4,13 @@
   gather_facts: false
 
   tasks:
-    - name: Check pcs status
-      ansible.builtin.command: pcs sstatus
+    - name: Check cluster status
+      ansible.builtin.command:
+        cmd: /usr/sbin/crm_mon -l
       become: true
-      register: pcs_result
+      register: cluster_status
       changed_when: false
 
-    - name: show pcs status
+    - name: show cluster status
       ansible.builtin.debug:
-        var: pcs_result.stdout_lines
+        var: cluster_statsu.stdout_lines
