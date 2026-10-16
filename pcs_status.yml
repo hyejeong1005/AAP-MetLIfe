@@ -9,7 +9,6 @@
       ansible.builtin.command:
         argv:
           - sudo
-          - -n
           - /isr/sbin/crm_mon
           - -1
       register: cluster_status
