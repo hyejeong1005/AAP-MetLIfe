@@ -2,14 +2,14 @@
 - name: Pacemaker Cluster Status Check
   hosts: all
   gather_facts: false
-  become: false
+  become: true
 
   tasks:
     - name: Check cluster status
       ansible.builtin.command:
         argv:
           - sudo
-          - /isr/sbin/crm_mon
+          - /usr/sbin/crm_mon
           - -1
       register: cluster_status
       changed_when: false
