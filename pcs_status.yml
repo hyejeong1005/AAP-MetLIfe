@@ -1,6 +1,6 @@
 ---
 - name: Pacemaker Cluster Status Check
-  hosts: pacemaker
+  hosts: all
   gather_facts: false
 
   tasks:
