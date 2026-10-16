@@ -1,14 +1,15 @@
 ---
 - name: Pacemaker Cluster Status Check
-  hosts: all
+  hosts: postgresql-ha
   gather_facts: false
-  become: true
+  become: false
 
   tasks:
     - name: Check cluster status
       ansible.builtin.command:
         argv:
           - sudo
+          - -n
           - /usr/sbin/crm_mon
           - -1
       register: cluster_status
@@ -16,4 +17,4 @@
 
     - name: Show cluster status
       ansible.builtin.debug:
-        var: clusteR_status.stdout_lines
+        var: cluster_status.stdout_lines
