@@ -1,0 +1,117 @@
+---
+- name: Collect Linux inventory directly over SSH into CSV reports
+  hosts: managed_linux
+  gather_facts: false
+  become: false
+  strategy: linear
+  vars:
+    report_dir: /reports
+    inventory_fail_on_error: true
+  pre_tasks:
+    - name: Require a normal Run job
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+        fail_msg: Use a Run job; report generation is not supported in Check Mode.
+      run_once: true
+
+    - name: Validate output directory inside the EE
+      ansible.builtin.stat:
+        path: "{{ report_dir }}"
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      register: report_directory
+      run_once: true
+
+    - name: Require a writable persistent report directory
+      ansible.builtin.assert:
+        that:
+          - report_directory.stat.isdir | default(false)
+          - report_directory.stat.writeable | default(false)
+      run_once: true
+
+  tasks:
+    - name: Gather fresh facts for missing fields and current system state
+      ansible.builtin.setup:
+        gather_subset: [all]
+        gather_timeout: 30
+      register: live_inventory_result
+      ignore_errors: true
+      ignore_unreachable: true
+
+    - name: Gather fresh services
+      ansible.builtin.service_facts:
+      when:
+        - not (live_inventory_result.failed | default(false))
+        - not (live_inventory_result.unreachable | default(false))
+      register: live_service_result
+      ignore_errors: true
+      ignore_unreachable: true
+
+    - name: Create consolidated report on EE localhost
+      delegate_to: localhost
+      become: false
+      run_once: true
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      block:
+        - name: Allocate private temporary directory
+          ansible.builtin.tempfile:
+            state: directory
+            path: "{{ report_dir }}"
+            prefix: .direct-input-
+          register: report_workspace
+
+        - name: Write one input record for every selected host
+          ansible.builtin.copy:
+            dest: "{{ report_workspace.path }}/input.json"
+            mode: '0600'
+            content: |
+              [
+              {% for host in ansible_play_hosts_all %}
+              {{ {'inventory_hostname': host,
+                  'connection_address': hostvars[host].ansible_host | default(host),
+                  'field_map': {},
+                  'satellite': {'skipped': true},
+                  'setup': hostvars[host].live_inventory_result | default({'failed': true}),
+                  'services': hostvars[host].live_service_result | default({'skipped': true})} | to_json }}{{ ',' if not loop.last else '' }}
+              {% endfor %}
+              ]
+          no_log: true
+
+        - name: Generate UTF-8 BOM CSV reports with Python standard library
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/inventory_to_csv.py"
+              - --input
+              - "{{ report_workspace.path }}/input.json"
+              - --output-dir
+              - "{{ report_dir }}"
+          register: report_export
+          changed_when: true
+
+        - name: Publish report paths and counts
+          ansible.builtin.set_stats:
+            data:
+              direct_inventory_report: "{{ report_export.stdout | from_json }}"
+            aggregate: false
+            per_host: false
+
+        - name: Show report paths and counts
+          ansible.builtin.debug:
+            msg: "{{ report_export.stdout | from_json }}"
+
+        - name: Fail incomplete collection after saving its report
+          ansible.builtin.assert:
+            that: (report_export.stdout | from_json).error_hosts == 0
+            fail_msg: Reports were saved; some sources failed. See collection_result.csv.
+          when: inventory_fail_on_error | bool
+      always:
+        - name: Remove temporary raw results
+          ansible.builtin.file:
+            path: "{{ report_workspace.path }}"
+            state: absent
+          when: report_workspace is defined and report_workspace.path is defined
+

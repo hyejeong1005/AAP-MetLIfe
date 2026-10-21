@@ -1,0 +1,132 @@
+---
+- name: Control OS or configured DB WAS WEB services
+  hosts: managed_linux
+  gather_facts: false
+  become: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    control_scope: services
+    control_action: status
+    lifecycle_confirm: false
+  pre_tasks:
+    - name: Validate scope and action
+      ansible.builtin.assert:
+        that:
+          - control_scope in ['services', 'os']
+          - (control_scope == 'services' and control_action in ['status', 'start', 'stop']) or (control_scope == 'os' and control_action in ['status', 'reboot', 'shutdown', 'power_on'])
+          - control_action == 'status' or lifecycle_confirm | bool
+          - not ansible_check_mode
+        fail_msg: Use Run mode and lifecycle_confirm=true for a state-changing operation.
+
+  tasks:
+    - name: Require service definitions
+      ansible.builtin.assert:
+        that:
+          - service_definitions | default([]) | length > 0
+      when: control_scope == 'services'
+
+    - name: Control services in configured order, reversed for stop
+      ansible.builtin.include_tasks: tasks/service_state.yml
+      vars:
+        svc_action: "{{ control_action }}"
+      loop: "{{ service_definitions | default([]) | reverse | list if control_action == 'stop' else service_definitions | default([]) }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: control_scope == 'services'
+
+    - name: Require a separate infrastructure group and independent run location
+      ansible.builtin.assert:
+        that:
+          - groups.get('automation_infrastructure', []) | length > 0
+          - inventory_hostname not in groups.get('automation_infrastructure', [])
+          - os_control_configured | default(false) | bool
+        fail_msg: Declare automation_infrastructure and confirm OS control prerequisites; do not power off the AAP execution infrastructure.
+      when: control_scope == 'os' and control_action != 'status'
+
+    - name: Request Satellite power on from the EE, without SSH to the powered-off host
+      redhat.satellite.host_power:
+        server_url: "{{ satellite_url }}"
+        username: "{{ satellite_username }}"
+        password: "{{ satellite_password }}"
+        ca_path: "{{ satellite_ca_path | default(omit) }}"
+        validate_certs: true
+        name: "{{ satellite_hostname | default(inventory_hostname) }}"
+        state: 'on'
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      no_log: true
+      when: control_scope == 'os' and control_action == 'power_on'
+
+    - name: Wait for OS SSH and module execution after power on
+      ansible.builtin.wait_for_connection:
+        timeout: "{{ os_boot_timeout | default(900) }}"
+      when: control_scope == 'os' and control_action == 'power_on'
+
+    - name: Require declared service handling before OS interruption
+      ansible.builtin.assert:
+        that: os_services_configured | default(false) | bool
+        fail_msg: Define service_definitions and set os_services_configured=true, or explicitly accept an empty list for an OS-only host.
+      when: control_scope == 'os' and control_action in ['reboot', 'shutdown']
+
+    - name: Stop declared services before reboot or shutdown
+      ansible.builtin.include_tasks: tasks/service_state.yml
+      vars:
+        svc_action: stop
+      loop: "{{ service_definitions | default([]) | reverse | list }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: control_scope == 'os' and control_action in ['reboot', 'shutdown']
+
+    - name: Reboot OS and wait for return
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ os_boot_timeout | default(900) }}"
+      become: true
+      become_user: root
+      when: control_scope == 'os' and control_action == 'reboot'
+
+    - name: Restore declared services after reboot
+      ansible.builtin.include_tasks: tasks/service_state.yml
+      vars:
+        svc_action: start
+      loop: "{{ service_definitions | default([]) }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: control_scope == 'os' and control_action == 'reboot'
+
+    - name: Schedule graceful OS shutdown
+      ansible.builtin.command:
+        argv: [/usr/sbin/shutdown, -h, '+1']
+      become: true
+      become_user: root
+      when: control_scope == 'os' and control_action == 'shutdown'
+
+    - name: Wait for SSH to stop after shutdown request
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: "{{ ansible_port | default(22) }}"
+        state: stopped
+        delay: 70
+        timeout: 300
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      when: control_scope == 'os' and control_action == 'shutdown'
+
+    - name: Show current kernel when OS status is requested
+      ansible.builtin.command:
+        argv: [/usr/bin/uname, -r]
+      register: os_status
+      changed_when: false
+      when: control_scope == 'os' and control_action == 'status'
+
+    - name: Show OS operation result
+      ansible.builtin.debug:
+        msg: "{{ os_status.stdout if control_action == 'status' else 'Requested OS operation completed; shutdown SSH closure does not prove physical power-off. Power-on does not start application services automatically through this playbook.' }}"
+      when: control_scope == 'os'

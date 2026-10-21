@@ -1,0 +1,18 @@
+---
+patch_action: precheck
+patch_scope: security  # security | all | packages
+patch_confirm: false
+patch_reboot_policy: never  # never | if_required
+# Concrete repo IDs visible in the approved internal repository configuration. No wildcards.
+patch_repo_ids:
+  - rhel-9-for-x86_64-baseos-rpms
+  - rhel-9-for-x86_64-appstream-rpms
+# Actual content providers, including any Capsule hostnames used in baseurl.
+patch_content_hosts:
+  - repo.example.internal
+# patch_packages: [openssl, openssl-libs]  # used only for packages scope
+patch_dnf_python: /usr/bin/python3
+patch_services_configured: false
+# Set patch_services_configured=true AFTER assigning actual service_definitions.
+# An empty list explicitly means no application services are controlled.
+

@@ -1,0 +1,23 @@
+---
+# Traditional WebSphere application server only. Validate status output locally.
+# Dmgr, Node Agent and cross-host ND orchestration must be designed separately.
+service_definitions:
+  - name: websphere_server1
+    kind: command
+    user: wasuser
+    profile: /app/wasuser/.bash_profile
+    start_argv:
+      - /opt/IBM/WebSphere/AppServer/profiles/AppSrv01/bin/startServer.sh
+      - server1
+    stop_argv:
+      - /opt/IBM/WebSphere/AppServer/profiles/AppSrv01/bin/stopServer.sh
+      - server1
+    status_argv:
+      - /opt/IBM/WebSphere/AppServer/profiles/AppSrv01/bin/serverStatus.sh
+      - server1
+    status_ok_rcs: [0, 1]
+    running_regex: ADMU0508I
+    stopped_regex: ADMU0509I
+    retries: 30
+    delay: 5
+

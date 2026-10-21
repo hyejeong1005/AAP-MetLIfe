@@ -1,0 +1,8 @@
+---
+# For services ON ONE HOST: start in list order; stop in reverse list order.
+# Replace these standalone systemd examples with the customer's actual services.
+service_definitions:
+  - {name: db, kind: systemd, unit: postgresql-15}
+  - {name: was, kind: systemd, unit: tomcat}
+  - {name: web, kind: systemd, unit: httpd}
+

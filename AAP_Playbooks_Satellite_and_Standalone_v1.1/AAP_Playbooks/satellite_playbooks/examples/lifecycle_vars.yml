@@ -1,0 +1,11 @@
+---
+control_scope: services  # services | os
+control_action: status
+lifecycle_confirm: false
+os_control_configured: false
+os_services_configured: false
+os_boot_timeout: 900
+# services actions: status | start | stop
+# os actions: status | reboot | shutdown | power_on
+# For power_on: configure Satellite BMC/Compute Resource integration first.
+

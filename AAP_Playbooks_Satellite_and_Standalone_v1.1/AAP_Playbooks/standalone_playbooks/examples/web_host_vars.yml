@@ -1,0 +1,7 @@
+---
+# Assign only to the intended WEB host through AAP host vars or Git host_vars.
+service_definitions:
+  - name: apache
+    kind: systemd
+    unit: httpd
+

@@ -1,0 +1,7 @@
+---
+# Standalone PostgreSQL EXAMPLE ONLY. Do not use for Pacemaker/Patroni resources.
+service_definitions:
+  - name: standalone_postgresql
+    kind: systemd
+    unit: postgresql-15
+

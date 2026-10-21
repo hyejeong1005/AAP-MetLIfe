@@ -1,0 +1,207 @@
+---
+- name: Patch RHEL from explicitly approved internal repositories
+  hosts: managed_linux
+  gather_facts: true
+  become: true
+  become_user: root
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    patch_action: precheck
+    patch_scope: security
+    patch_confirm: false
+    patch_reboot_policy: never
+    patch_repo_ids: []
+    patch_content_hosts: []
+  pre_tasks:
+    - name: Validate patch intent and declared scope
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - ansible_facts.distribution == 'RedHat'
+          - ansible_facts.distribution_major_version in ['8', '9']
+          - patch_action in ['precheck', 'apply']
+          - patch_scope in ['security', 'all', 'packages']
+          - patch_reboot_policy in ['never', 'if_required']
+          - patch_repo_ids | length > 0
+          - patch_content_hosts | length > 0
+          - patch_repo_ids is not string
+          - patch_content_hosts is not string
+          - patch_scope != 'packages' or patch_packages | default([]) | length > 0
+          - patch_scope != 'packages' or patch_packages is not string
+          - patch_action != 'apply' or patch_confirm | bool
+          - patch_action != 'apply' or patch_services_configured | default(false) | bool
+        fail_msg: Declare internal repo IDs and content hostnames; apply also requires patch_confirm and patch_services_configured.
+
+    - name: Prevent patching the automation execution infrastructure
+      ansible.builtin.assert:
+        that:
+          - groups.get('automation_infrastructure', []) | length > 0
+          - inventory_hostname not in groups.get('automation_infrastructure', [])
+      when: patch_action == 'apply'
+
+    - name: Verify repository URLs and trust settings before preview or mutation
+      ansible.builtin.command:
+        argv:
+          - "{{ patch_dnf_python | default('/usr/bin/python3') }}"
+          - -c
+          - |
+            import dnf, json, sys
+            from urllib.parse import urlsplit
+            ids, hosts = json.loads(sys.argv[1]), set(json.loads(sys.argv[2]))
+            base = dnf.Base()
+            base.read_all_repos()
+            for ident in ids:
+                if any(c in ident for c in '*?['):
+                    raise SystemExit('Use concrete repository IDs, not patterns')
+                repo = base.repos[ident]
+                if repo.metalink or repo.mirrorlist or not repo.baseurl:
+                    raise SystemExit('Require explicit internal baseurl: ' + ident)
+                for url in repo.baseurl:
+                    parsed = urlsplit(url)
+                    if parsed.scheme != 'https' or parsed.hostname not in hosts:
+                        raise SystemExit('Unapproved repository URL: ' + ident)
+                if not repo.gpgcheck or not repo.sslverify:
+                    raise SystemExit('GPG checking and TLS verification are required: ' + ident)
+            print(json.dumps({'approved_repository_ids': ids}))
+          - "{{ patch_repo_ids | to_json }}"
+          - "{{ patch_content_hosts | to_json }}"
+      changed_when: false
+
+    - name: List loaded DNF commands before accepting needs-restarting return code 1
+      ansible.builtin.command:
+        argv: [/usr/bin/dnf, --help]
+      environment:
+        LC_ALL: C
+      register: dnf_help
+      changed_when: false
+
+    - name: Require the actual needs-restarting plugin
+      ansible.builtin.assert:
+        that: dnf_help.stdout is search('(?m)^\s*needs-restarting\s')
+        fail_msg: Install and enable the DNF needs-restarting plugin from internal before patching.
+
+    - name: Read current reboot requirement
+      ansible.builtin.command:
+        argv: [/usr/bin/dnf, needs-restarting, -r]
+      register: reboot_precheck
+      changed_when: false
+      failed_when: reboot_precheck.rc not in [0, 1]
+
+    - name: Verify initial state of all declared patch services
+      ansible.builtin.include_tasks: tasks/service_state.yml
+      vars:
+        svc_action: status
+        svc_require_running: true
+      loop: "{{ service_definitions | default([]) }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+
+    - name: Resolve package update transaction without applying it
+      ansible.builtin.dnf:
+        name: "{{ patch_packages if patch_scope == 'packages' else ['*'] }}"
+        state: latest
+        update_only: true
+        security: "{{ patch_scope == 'security' }}"
+        disablerepo: ['*']
+        enablerepo: "{{ patch_repo_ids }}"
+        update_cache: true
+        lock_timeout: 120
+        disable_gpg_check: false
+        sslverify: true
+        skip_broken: false
+        allowerasing: false
+      check_mode: true
+      register: patch_preview
+
+    - name: Show resolved update preview
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          scope: "{{ patch_scope }}"
+          repositories: "{{ patch_repo_ids }}"
+          reboot_was_pending: "{{ reboot_precheck.rc == 1 }}"
+          preview: "{{ patch_preview }}"
+
+  tasks:
+    - name: Report no update transaction or pending reboot
+      ansible.builtin.debug:
+        msg: No package update or pending reboot was detected; declared services will not be interrupted.
+      when:
+        - patch_action == 'apply'
+        - not (patch_preview.changed | bool)
+        - reboot_precheck.rc == 0
+
+    - name: Apply patch to one host and verify it before continuing
+      when:
+        - patch_action == 'apply'
+        - patch_preview.changed | bool or reboot_precheck.rc == 1
+      block:
+        - name: Stop declared services in reverse order
+          ansible.builtin.include_tasks: tasks/service_state.yml
+          vars:
+            svc_action: stop
+          loop: "{{ service_definitions | default([]) | reverse | list }}"
+          loop_control:
+            loop_var: svc
+            label: "{{ svc.name }}"
+
+        - name: Update installed packages only from approved repositories
+          ansible.builtin.dnf:
+            name: "{{ patch_packages if patch_scope == 'packages' else ['*'] }}"
+            state: latest
+            update_only: true
+            security: "{{ patch_scope == 'security' }}"
+            disablerepo: ['*']
+            enablerepo: "{{ patch_repo_ids }}"
+            update_cache: true
+            lock_timeout: 120
+            disable_gpg_check: false
+            sslverify: true
+            skip_broken: false
+            allowerasing: false
+          register: patch_transaction
+
+        - name: Determine whether an OS reboot is needed
+          ansible.builtin.command:
+            argv: [/usr/bin/dnf, needs-restarting, -r]
+          register: reboot_required
+          changed_when: false
+          failed_when: reboot_required.rc not in [0, 1]
+
+        - name: Reboot only when configured and required
+          ansible.builtin.reboot:
+            reboot_timeout: "{{ patch_reboot_timeout | default(1200) }}"
+          when: reboot_required.rc == 1 and patch_reboot_policy == 'if_required'
+
+        - name: Restore declared services in start order and check their state
+          ansible.builtin.include_tasks: tasks/service_state.yml
+          vars:
+            svc_action: start
+          loop: "{{ service_definitions | default([]) }}"
+          loop_control:
+            loop_var: svc
+            label: "{{ svc.name }}"
+
+        - name: Show patch result
+          ansible.builtin.debug:
+            msg:
+              host: "{{ inventory_hostname }}"
+              transaction: "{{ patch_transaction.results | default([]) }}"
+              reboot_detected: "{{ reboot_required.rc == 1 }}"
+              reboot_permitted: "{{ patch_reboot_policy == 'if_required' }}"
+
+        - name: Stop batch if required reboot was deferred
+          ansible.builtin.assert:
+            that: reboot_required.rc == 0 or patch_reboot_policy == 'if_required'
+            fail_msg: Services were restored, but a required reboot was deferred. Review before continuing the batch.
+
+      rescue:
+        - name: Stop automation and report the failing step
+          ansible.builtin.fail:
+            msg: >-
+              Patching stopped on {{ inventory_hostname }} at {{ ansible_failed_task.name }}.
+              Error: {{ ansible_failed_result.msg | default('Inspect job events') }}.
+              No automatic rollback or unconditional recovery start was performed.
+              Some services may remain stopped; review this host before restarting the batch.

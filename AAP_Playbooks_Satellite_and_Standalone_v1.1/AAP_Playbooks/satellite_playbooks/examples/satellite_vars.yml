@@ -1,0 +1,10 @@
+---
+satellite_url: https://satellite.example.internal
+satellite_organization: ExampleOrganization
+# This is the path INSIDE the EE. Omit if the internal CA is already trusted.
+satellite_ca_path: /etc/pki/ca-trust/source/anchors/customer-ca.pem
+report_dir: /reports
+inventory_fail_on_error: true
+# Inject satellite_username and satellite_password via an AAP custom credential.
+# satellite_hostname: actual-registered-fqdn.example.internal
+

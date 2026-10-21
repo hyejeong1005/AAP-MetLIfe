@@ -1,0 +1,116 @@
+---
+- name: Validate service definition
+  ansible.builtin.assert:
+    that:
+      - svc.kind | default('') in ['systemd', 'command']
+      - svc.name | default('') | length > 0
+      - svc_action in ['status', 'start', 'stop']
+
+- name: Validate custom command definition
+  ansible.builtin.assert:
+    that:
+      - svc.status_argv is defined and svc.status_argv is sequence and svc.status_argv is not string
+      - svc.start_argv is defined and svc.start_argv is sequence and svc.start_argv is not string
+      - svc.stop_argv is defined and svc.stop_argv is sequence and svc.stop_argv is not string
+      - svc.status_argv | length > 0
+      - svc.start_argv | length > 0
+      - svc.stop_argv | length > 0
+      - (svc.running_regex is defined) == (svc.stopped_regex is defined)
+      - svc.running_regex | default('x') | length > 0
+      - svc.stopped_regex | default('x') | length > 0
+  when: svc.kind == 'command'
+
+- name: Build status command with optional explicit Bash profile loading
+  ansible.builtin.set_fact:
+    svc_status_argv: >-
+      {{ ['/usr/bin/systemctl', 'is-active', svc.unit | default(svc.name)] if svc.kind == 'systemd' else ((['/bin/bash', '-c', 'source "$1" && shift && exec "$@"', 'aap-profile', svc.profile] if svc.profile | default('') | length > 0 else []) + svc.status_argv) }}
+    svc_command_prefix: >-
+      {{ ['/bin/bash', '-c', 'source "$1" && shift && exec "$@"', 'aap-profile', svc.profile] if svc.profile | default('') | length > 0 else [] }}
+
+- name: Read current service state
+  ansible.builtin.command:
+    argv: "{{ svc_status_argv }}"
+  become: true
+  become_user: "{{ svc.user | default('root') }}"
+  environment: "{{ svc.environment | default({}) }}"
+  register: svc_before
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Classify current service state
+  ansible.builtin.set_fact:
+    svc_running: "{{ ((svc_before.stdout ~ svc_before.stderr) is search(svc.running_regex)) if svc.kind == 'command' and svc.running_regex is defined else (svc_before.stdout == 'active' if svc.kind == 'systemd' else svc_before.rc == (svc.running_rc | default(0))) }}"
+    svc_stopped: "{{ ((svc_before.stdout ~ svc_before.stderr) is search(svc.stopped_regex)) if svc.kind == 'command' and svc.stopped_regex is defined else (svc_before.stdout in ['inactive', 'failed'] if svc.kind == 'systemd' else svc_before.rc == (svc.stopped_rc | default(3))) }}"
+
+- name: Reject ambiguous state, missing unit, authentication or command failures
+  ansible.builtin.assert:
+    that:
+      - svc_before.rc in (svc.status_ok_rcs | default([0, 3]))
+      - (svc_running | bool) != (svc_stopped | bool)
+    fail_msg: "{{ svc.name }} status is unknown. Validate status command, return codes and output patterns."
+
+- name: Show recognized service state
+  ansible.builtin.debug:
+    msg:
+      service: "{{ svc.name }}"
+      running: "{{ svc_running | bool }}"
+
+- name: Require initially running services before patching
+  ansible.builtin.assert:
+    that: svc_running | bool
+    fail_msg: A required patch service is not running; stop and review before patching.
+  when: svc_require_running | default(false) | bool
+
+- name: Change systemd service state
+  ansible.builtin.systemd_service:
+    name: "{{ svc.unit | default(svc.name) }}"
+    state: "{{ 'started' if svc_action == 'start' else 'stopped' }}"
+  become: true
+  become_user: root
+  when:
+    - svc.kind == 'systemd'
+    - svc_action != 'status'
+    - (svc_action == 'start' and not (svc_running | bool)) or (svc_action == 'stop' and not (svc_stopped | bool))
+
+- name: Run custom start or stop command
+  async: "{{ svc.command_timeout | default(300) }}"
+  poll: 5
+  ansible.builtin.command:
+    argv: "{{ svc_command_prefix + (svc.start_argv if svc_action == 'start' else svc.stop_argv) }}"
+  become: true
+  become_user: "{{ svc.user | default('root') }}"
+  environment: "{{ svc.environment | default({}) }}"
+  when:
+    - svc.kind == 'command'
+    - svc_action != 'status'
+    - (svc_action == 'start' and not (svc_running | bool)) or (svc_action == 'stop' and not (svc_stopped | bool))
+
+- name: Wait for requested service state
+  ansible.builtin.command:
+    argv: "{{ svc_status_argv }}"
+  become: true
+  become_user: "{{ svc.user | default('root') }}"
+  environment: "{{ svc.environment | default({}) }}"
+  register: svc_after
+  changed_when: false
+  failed_when: false
+  until: >-
+    svc_after.rc in (svc.status_ok_rcs | default([0, 3])) and
+    ((((svc_after.stdout ~ svc_after.stderr) is search(svc.running_regex if svc_action == 'start' else svc.stopped_regex)))
+    if svc.kind == 'command' and svc.running_regex is defined else
+    ((svc_after.stdout == 'active' if svc_action == 'start' else svc_after.stdout in ['inactive', 'failed']) if svc.kind == 'systemd' else (svc_after.rc == ((svc.running_rc | default(0)) if svc_action == 'start' else (svc.stopped_rc | default(3))))))
+  retries: "{{ svc.retries | default(30) }}"
+  delay: "{{ svc.delay | default(5) }}"
+  when: svc_action != 'status' and not ansible_check_mode
+
+- name: Reject conflicting output patterns after transition
+  ansible.builtin.assert:
+    that:
+      - not (((svc_after.stdout ~ svc_after.stderr) is search(svc.running_regex)) and ((svc_after.stdout ~ svc_after.stderr) is search(svc.stopped_regex)))
+  when:
+    - svc_action != 'status'
+    - not ansible_check_mode
+    - svc.kind == 'command'
+    - svc.running_regex is defined
+
